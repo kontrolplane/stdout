@@ -1,0 +1,16 @@
+services:
+  loki:
+    container_name: "${LOKI_DOCKER_NAME:-stdout-loki}"
+    image: grafana/loki:3.5.5
+    command: ["-config.file=/etc/loki/config.yaml"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - "./seed/loki.yaml:/etc/loki/config.yaml:ro"
+      - "${LOKI_VOLUME_DIR:-./volume}:/loki"
+    user: "0"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

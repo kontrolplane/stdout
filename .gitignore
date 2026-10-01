@@ -1,0 +1,9 @@
+# go
+/build/
+/dist/
+
+# bubbletea
+debug.log
+
+# docker
+/volume/
