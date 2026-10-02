@@ -22,6 +22,8 @@ Show
 Sleep 3s
 
 Screenshot ./assets/pages/labels.png
+# VHS takes the shot with a frame of its own, which can come late on a busy machine.
+Sleep 2s
 
 # app=~"api|worker"
 Tab
@@ -41,11 +43,13 @@ Space
 Sleep 2s
 
 Screenshot ./assets/pages/selection.png
+Sleep 2s
 
 Enter
 Sleep 5s
 
 Screenshot ./assets/pages/tail.png
+Sleep 2s
 
 Type "/"
 Sleep 500ms
@@ -55,6 +59,7 @@ Enter
 Sleep 3s
 
 Screenshot ./assets/pages/filter.png
+Sleep 2s
 
 Space
 Sleep 500ms
@@ -62,6 +67,7 @@ Enter
 Sleep 4s
 
 Screenshot ./assets/pages/line.png
+Sleep 2s
 
 Type "]"
 Sleep 2s
@@ -74,6 +80,7 @@ Type "w"
 Sleep 3s
 
 Screenshot ./assets/pages/wrap.png
+Sleep 2s
 
 Type "w"
 Sleep 1s
@@ -89,6 +96,7 @@ Type "?"
 Sleep 3s
 
 Screenshot ./assets/pages/help.png
+Sleep 2s
 
 Type "?"
 Sleep 1s
