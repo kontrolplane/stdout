@@ -73,7 +73,11 @@ func DetectLevel(e Entry) Level {
 			}
 		}
 	}
-	if fields := Fields(e.Line); fields != nil {
+	if l, ok := jsonLevel(e.Line); ok {
+		if l != LevelUnknown {
+			return l
+		}
+	} else if fields := logfmt(e.Line); fields != nil {
 		for _, k := range levelKeys {
 			for _, f := range fields {
 				if strings.EqualFold(f.Key, k) {
@@ -85,6 +89,133 @@ func DetectLevel(e Entry) Level {
 		}
 	}
 	return levelWord(e.Line)
+}
+
+// jsonLevel finds the level in the top level fields of a JSON object, without decoding the rest of
+// it: every line of a tail goes through here. It reports false for a line that is not an object,
+// and LevelUnknown for an object without a level, which then has none of its own.
+func jsonLevel(line string) (Level, bool) {
+	level, rank := LevelUnknown, len(levelKeys)
+	ok := scanObject(line, func(key, value string) {
+		for i, k := range levelKeys[:rank] {
+			if !strings.EqualFold(key, k) {
+				continue
+			}
+			if strings.HasPrefix(value, `"`) {
+				var s string
+				if json.Unmarshal([]byte(value), &s) != nil {
+					return
+				}
+				value = s
+			}
+			if l := ParseLevel(value); l != LevelUnknown {
+				level, rank = l, i
+			}
+			return
+		}
+	})
+	return level, ok
+}
+
+// scanObject calls fn with every top level key of a JSON object and its value as written, and
+// reports whether s is an object. Keys with escapes are passed on as written too, no level key
+// needs one.
+func scanObject(s string, fn func(key, value string)) bool {
+	i := skipSpace(s, 0)
+	if i >= len(s) || s[i] != '{' {
+		return false
+	}
+	i = skipSpace(s, i+1)
+	if i < len(s) && s[i] == '}' {
+		return skipSpace(s, i+1) == len(s)
+	}
+	for i < len(s) {
+		if s[i] != '"' {
+			return false
+		}
+		end := skipValue(s, i)
+		if end < 0 {
+			return false
+		}
+		key := s[i+1 : end-1]
+		i = skipSpace(s, end)
+		if i >= len(s) || s[i] != ':' {
+			return false
+		}
+		i = skipSpace(s, i+1)
+		end = skipValue(s, i)
+		if end < 0 {
+			return false
+		}
+		fn(key, s[i:end])
+		i = skipSpace(s, end)
+		if i >= len(s) {
+			return false
+		}
+		switch s[i] {
+		case '}':
+			return skipSpace(s, i+1) == len(s)
+		case ',':
+			i = skipSpace(s, i+1)
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func skipSpace(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+		i++
+	}
+	return i
+}
+
+// skipValue returns where the JSON value starting at i ends, or -1 when it does not.
+func skipValue(s string, i int) int {
+	if i >= len(s) {
+		return -1
+	}
+	switch s[i] {
+	case '"':
+		for j := i + 1; j < len(s); j++ {
+			switch s[j] {
+			case '\\':
+				j++
+			case '"':
+				return j + 1
+			}
+		}
+		return -1
+	case '{', '[':
+		depth := 0
+		for j := i; j < len(s); j++ {
+			switch s[j] {
+			case '"':
+				end := skipValue(s, j)
+				if end < 0 {
+					return -1
+				}
+				j = end - 1
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return j + 1
+				}
+			}
+		}
+		return -1
+	}
+	j := i
+	for j < len(s) && strings.IndexByte(",}] \t\n\r", s[j]) < 0 {
+		j++
+	}
+	if j == i {
+		return -1
+	}
+	return j
 }
 
 // levelWord finds a level written as a word of its own in the first part of a line, as in

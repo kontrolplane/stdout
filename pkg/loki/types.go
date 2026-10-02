@@ -29,15 +29,26 @@ type Entry struct {
 	Time   time.Time
 	Line   string
 	Labels Labels // the labels of the stream, as indexed
+	// Stream is Labels as a selector, worked out once for all the entries of a stream. Entries
+	// made elsewhere may leave it empty, StreamKey then works it out.
+	Stream string
 	// Metadata and Parsed are only told apart from the stream labels when the server categorizes
 	// them, which Loki 3 does. Older servers fold them into Labels.
 	Metadata Labels // structured metadata attached to the line
 	Parsed   Labels // labels extracted by a parser stage of the query
 }
 
+// StreamKey identifies the stream of the entry: its labels as a selector.
+func (e Entry) StreamKey() string {
+	if e.Stream != "" {
+		return e.Stream
+	}
+	return e.Labels.String()
+}
+
 // Key identifies an entry: two entries with the same time, line and stream are the same entry.
 func (e Entry) Key() string {
-	return strconv.FormatInt(e.Time.UnixNano(), 10) + "\x00" + e.Labels.String() + "\x00" + e.Line
+	return strconv.FormatInt(e.Time.UnixNano(), 10) + "\x00" + e.StreamKey() + "\x00" + e.Line
 }
 
 // Dropped is an entry the server left out of the tail because the client did not keep up.
@@ -71,6 +82,7 @@ type categories struct {
 // labels [timestamp, line, {structuredMetadata, parsed}].
 func (s stream) entries() ([]Entry, error) {
 	out := make([]Entry, 0, len(s.Values))
+	key := s.Stream.String()
 	for _, raw := range s.Values {
 		var parts []json.RawMessage
 		if err := json.Unmarshal(raw, &parts); err != nil {
@@ -90,7 +102,7 @@ func (s stream) entries() ([]Entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		e := Entry{Time: t, Line: line, Labels: s.Stream}
+		e := Entry{Time: t, Line: line, Labels: s.Stream, Stream: key}
 		if len(parts) > 2 {
 			var c categories
 			if err := json.Unmarshal(parts[2], &c); err == nil {
