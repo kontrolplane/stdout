@@ -62,15 +62,31 @@ func (m model) renderHeader() string {
 	width := frameWidth - headerIndent
 	columns := [][]headerFact{m.connectionFacts(), m.serverFacts()}
 	columns = append(columns, m.pageFacts()...)
-	facts := factsGrid(width, columns...)
-	if facts == "" {
-		facts = factsGrid(width, columns[1:]...)
+
+	var key strings.Builder
+	fmt.Fprint(&key, width)
+	for _, facts := range columns {
+		key.WriteString("\x01")
+		for _, f := range facts {
+			key.WriteString("\x00" + f.label)
+			for _, s := range f.value {
+				fmt.Fprintf(&key, "\x00%s\x00%d%v", s.Text, s.Tone, s.Bold)
+			}
+		}
 	}
-	if facts == "" {
-		facts = factsGrid(-1, columns[1:]...)
-	}
-	return lipgloss.NewStyle().MarginLeft(headerIndent).Render(facts)
+	return headerMemo.get(key.String(), func() string {
+		facts := factsGrid(width, columns...)
+		if facts == "" {
+			facts = factsGrid(width, columns[1:]...)
+		}
+		if facts == "" {
+			facts = factsGrid(-1, columns[1:]...)
+		}
+		return lipgloss.NewStyle().MarginLeft(headerIndent).Render(facts)
+	})
 }
+
+var headerMemo memo
 
 // factsGrid lays the fact columns out across width, or returns "" when they do not fit. Spare
 // room goes between the columns so the grid spans the header. Without any, the first column gives

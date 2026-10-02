@@ -11,7 +11,7 @@
 ## views
 
 - `labels`: label names and their values, with how much each value ingested. Values are scoped to what is already picked, so the query is built with selections rather than typing
-- `tail`: the live tail, with the level and the labels that tell the streams apart next to every line. You can filter, highlight, pin, wrap, pause, and scroll back past the start into older lines
+- `tail`: the live tail, with the level and the labels that tell the streams apart next to every line. JSON and logfmt lines are tinted so their keys recede behind the values and the message stands out. You can filter, highlight, pin, wrap, pause, jump between warnings and errors, and scroll back past the start into older lines. Scrolled away from the newest line, the frame counts the lines that came in since
 - `line`: the time, level, stream labels, structured metadata and parsed fields of one line, with JSON indented and highlighted
 
 The header shows the server, the tenant, the Loki version, and while tailing the number of streams, the rate in lines per second, the lines held and the lines the server dropped.
@@ -40,11 +40,12 @@ The header shows the server, the tenant, the Loki version, and while tailing the
 
 - `↑`, `↓`, `pgup`, `pgdn`: move; `↑` on the oldest line loads the lines before it
 - `g`, `G`: oldest/newest line
+- `n`, `N`: next/previous warning or error
 - `enter`: open the line
 - `space`: pin the line, `tab` shows only the pinned lines
 - `f`: follow the newest line, or stop following
 - `p`: pause, new lines are held until you resume
-- `w`: wrap long lines
+- `w`: wrap long lines, between words where it can
 - `l`: show or hide the labels column
 - `/`: filter the lines on screen
 - `e`: edit the query, which restarts the tail
@@ -59,6 +60,7 @@ The header shows the server, the tenant, the Loki version, and while tailing the
 **line**
 
 - `↑`, `↓`, `g`, `G`: scroll
+- `tab`: scroll the labels and fields instead of the message, when there are more than fit
 - `[`, `]`: previous/next line
 - `space`: pin
 - `s`: tail only this line's stream

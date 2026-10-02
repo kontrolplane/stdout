@@ -19,8 +19,10 @@ import (
 
 type detailsState struct {
 	row      row
-	format   string // json, logfmt or text
-	viewport viewport.Model
+	format   string         // json, logfmt or text
+	viewport viewport.Model // the message
+	fields   viewport.Model // the time, labels and fields, which can be more than fit
+	onFields bool           // the keys scroll the fields rather than the message
 }
 
 func detailsViewportHeight() int { return contentHeight - 2 } // the section header and the gap under it
@@ -39,16 +41,35 @@ func (m model) openDetails(i int) (model, tea.Cmd) {
 	d.format = loki.Format(d.row.entry.Line)
 	d.viewport = viewport.New(viewport.WithWidth(rightContentWidth), viewport.WithHeight(detailsViewportHeight()))
 	d.viewport.SetContent(renderLine(d.row.entry.Line, rightContentWidth))
+	d.fields = viewport.New(viewport.WithWidth(leftContentWidth), viewport.WithHeight(contentHeight))
+	d.fields.SetContent(m.detailsFields())
+	if !d.fieldsOverflow() {
+		d.onFields = false
+	}
 	return m.SwitchPage(lineDetails), nil
 }
 
-// resize wraps the line again at the current width, keeping the scroll position.
-func (d *detailsState) resize() {
+// resize wraps the line again at the current width, keeping the scroll positions.
+func (m *model) resizeDetails() {
+	d := &m.details
 	offset := d.viewport.YOffset()
 	d.viewport.SetWidth(rightContentWidth)
 	d.viewport.SetHeight(detailsViewportHeight())
 	d.viewport.SetContent(renderLine(d.row.entry.Line, rightContentWidth))
 	d.viewport.SetYOffset(offset)
+	offset = d.fields.YOffset()
+	d.fields.SetWidth(leftContentWidth)
+	d.fields.SetHeight(contentHeight)
+	d.fields.SetContent(m.detailsFields())
+	d.fields.SetYOffset(offset)
+	if !d.fieldsOverflow() {
+		d.onFields = false
+	}
+}
+
+// fieldsOverflow reports whether the fields are more than the panel shows, so it scrolls.
+func (d detailsState) fieldsOverflow() bool {
+	return d.fields.TotalLineCount() > d.fields.Height()
 }
 
 // renderLine formats a line for reading: JSON indented and coloured, anything else wrapped.
@@ -68,8 +89,17 @@ func renderLine(line string, width int) string {
 
 func (m model) DetailsUpdate(msg tea.Msg) (model, tea.Cmd) {
 	d := &m.details
+	// The fields hold the age and whether the line is pinned, which change while it is open.
+	d.fields.SetContent(m.detailsFields())
+	scrolled := &d.viewport
+	if d.onFields {
+		scrolled = &d.fields
+	}
 	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 		switch {
+		case key.Matches(keyMsg, m.keys.SwitchFocus):
+			d.onFields = !d.onFields && d.fieldsOverflow()
+			return m, nil
 		case key.Matches(keyMsg, m.keys.Quit, m.keys.Back):
 			m = m.SwitchPage(tailView)
 			m.tail = m.tail.scroll()
@@ -103,19 +133,21 @@ func (m model) DetailsUpdate(msg tea.Msg) (model, tea.Cmd) {
 		case key.Matches(keyMsg, m.keys.Stream):
 			return m.startTail(loki.StreamSelector(d.row.entry.Labels))
 		case key.Matches(keyMsg, m.keys.Top):
-			d.viewport.GotoTop()
+			scrolled.GotoTop()
 			return m, nil
 		case key.Matches(keyMsg, m.keys.Bottom):
-			d.viewport.GotoBottom()
+			scrolled.GotoBottom()
 			return m, nil
 		}
 	}
 	var cmd tea.Cmd
-	d.viewport, cmd = d.viewport.Update(msg)
+	*scrolled, cmd = scrolled.Update(msg)
 	return m, cmd
 }
 
-func (m model) DetailsView() string {
+// detailsFields renders the left panel: the time and level of the line, its labels, structured
+// metadata and parsed labels, and the fields of a structured line.
+func (m model) detailsFields() string {
 	d := m.details
 	e := d.row.entry
 
@@ -127,10 +159,21 @@ func (m model) DetailsView() string {
 	if m.tail.pins[d.row.id] {
 		pinned = styles.S("yes", styles.ToneAccent)
 	}
+	title := styles.Fg(styles.ToneText).Bold(true)
+	if d.onFields {
+		title = styles.Fg(styles.ToneAccent).Bold(true)
+	}
+	meta := ""
+	if d.fieldsOverflow() {
+		meta = styles.Faint("tab scrolls")
+		if d.onFields {
+			meta = styles.Faint(fmt.Sprintf("%d%%", int(d.fields.ScrollPercent()*100)))
+		}
+	}
 	left := []string{
-		panelSection("line", true, leftContentWidth),
+		styles.SectionHeaderWith(title.Render("line"), meta, leftContentWidth),
 		panelRowSpans("time", styles.S(e.Time.Local().Format(timeFormat), styles.ToneBody)),
-		panelRowSpans("received", styles.S(formatAgo(e.Time), styles.ToneBody)),
+		panelRowSpans("age", styles.S(formatAgo(e.Time), styles.ToneBody)),
 		panelRowSpans("level", level),
 		panelRowSpans("size", styles.S(formatBytes(uint64(len(e.Line))), styles.ToneBody), styles.S("  "+d.format, styles.ToneFaint)),
 		panelRowSpans("pinned", pinned),
@@ -161,21 +204,29 @@ func (m model) DetailsView() string {
 			left = append(left, fieldRow(f.Key, f.Value))
 		}
 	}
-	if len(left) > contentHeight {
-		left = append(left[:contentHeight-1], strings.Repeat(" ", panelLabelWidth)+styles.Faint("…"))
-	}
+	return strings.Join(left, "\n")
+}
+
+func (m model) DetailsView() string {
+	d := m.details
+	fields := d.fields
+	fields.SetContent(m.detailsFields())
 
 	vp := d.viewport
 	meta := d.format
 	if vp.TotalLineCount() > vp.Height() {
 		meta += fmt.Sprintf(" · %d%%", int(vp.ScrollPercent()*100))
 	}
+	title := styles.Fg(styles.ToneText).Bold(true)
+	if !d.onFields && d.fieldsOverflow() {
+		title = styles.Fg(styles.ToneAccent).Bold(true)
+	}
 	right := lipgloss.JoinVertical(lipgloss.Left,
-		styles.SectionHeaderWith(styles.Bold("message"), styles.Faint(meta), rightContentWidth),
+		styles.SectionHeaderWith(title.Render("message"), styles.Faint(meta), rightContentWidth),
 		"",
 		vp.View(),
 	)
-	return splitPanels(lipgloss.JoinVertical(lipgloss.Left, left...), right)
+	return splitPanels(fields.View(), right)
 }
 
 // fieldRow renders a label or field. Names longer than the label column take what they need, up to

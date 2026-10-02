@@ -41,14 +41,6 @@ func panelLabel(label string) string {
 		Render(truncate(label, panelLabelWidth-2))
 }
 
-func panelSection(title string, first bool, width int) string {
-	header := styles.SectionHeader(title, width, false)
-	if !first {
-		return "\n" + header
-	}
-	return header
-}
-
 // splitPanels joins a left and right panel with a vertical divider, filling the content area.
 func splitPanels(left, right string) string {
 	panel := func(width int) lipgloss.Style {

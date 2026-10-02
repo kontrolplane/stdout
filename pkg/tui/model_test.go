@@ -301,6 +301,13 @@ func TestTailFailureShowsError(t *testing.T) {
 	if m.error != "" {
 		t.Error("any key should dismiss the error")
 	}
+
+	// The follow closes right after it fails, WaitTail can take both into one message.
+	m.tail.running = true
+	m = update(t, m, messages.TailMsg{Gen: 3, State: loki.Failed, Err: &loki.RefusedError{Reason: "refused"}, Closed: true})
+	if m.tail.state != loki.Failed || !strings.Contains(m.error, "refused") {
+		t.Errorf("a failure in a closing message: state %v, error %q", m.tail.state, m.error)
+	}
 }
 
 func TestOlderLines(t *testing.T) {
@@ -317,5 +324,29 @@ func TestOlderLines(t *testing.T) {
 	m = update(t, m, messages.OlderLoadedMsg{Gen: m.tail.gen, Err: errors.New("boom")})
 	if !strings.Contains(m.statusMsg, "boom") {
 		t.Errorf("status %q", m.statusMsg)
+	}
+}
+
+func TestDetailsFieldsScroll(t *testing.T) {
+	m := tailModel(t)
+	labels := loki.Labels{}
+	for i := range 60 {
+		labels[fmt.Sprintf("label_%02d", i)] = "value"
+	}
+	m.tail = m.tail.add([]loki.Entry{{Time: base.Add(10 * time.Second), Line: "many labels", Labels: labels}}, base)
+	m = send(t, m, "G", "enter")
+	if m.page != lineDetails || !m.details.fieldsOverflow() {
+		t.Fatalf("page %v, overflow %v", m.page, m.details.fieldsOverflow())
+	}
+	m = send(t, m, "tab", "G")
+	if !m.details.onFields || m.details.fields.YOffset() == 0 {
+		t.Errorf("tab should give the fields the keys: on fields %v, offset %d", m.details.onFields, m.details.fields.YOffset())
+	}
+	if !strings.Contains(ansi.Strip(m.render()), "label_59") {
+		t.Error("the last label should be on screen once scrolled down")
+	}
+	m = send(t, m, "tab")
+	if m.details.onFields {
+		t.Error("tab again goes back to the message")
 	}
 }

@@ -171,7 +171,7 @@ func initFilterInput(placeholder string) textinput.Model {
 
 // spread places left and right on one line of the given width.
 func spread(left, right string, width int) string {
-	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	gap := width - styledWidth(left) - styledWidth(right)
 	if gap < 1 {
 		gap = 1
 	}
@@ -193,7 +193,7 @@ func clip(s string, width, height int) string {
 		lines = lines[:max(height, 0)]
 	}
 	for i, line := range lines {
-		if ansi.StringWidth(line) > width {
+		if styledWidth(line) > width {
 			lines[i] = ansi.Truncate(line, width, "…")
 		}
 	}
@@ -227,18 +227,39 @@ func frame(title, meta, foot, body string) string {
 	}
 	bottom := border.Render("╰") + edge(frameWidth-3-footWidth) + foot + border.Render("─╯")
 
-	placed := lipgloss.Place(contentWidth, contentHeight, lipgloss.Center, lipgloss.Top, clip(body, contentWidth, contentHeight))
-	lines := append([]string{""}, strings.Split(placed, "\n")...)
-	lines = append(lines, "")
+	// The body fills the content area: cut to it, with every line centred in it as lipgloss.Place
+	// would, and a blank line above and below. Each line is measured once, this runs every frame.
+	lines := strings.Split(body, "\n")
+	lines = lines[:min(len(lines), contentHeight)]
+	side := border.Render("│")
+	blank := side + strings.Repeat(" ", contentWidth) + side
 
 	var b strings.Builder
+	b.Grow(len(body) + (contentHeight+4)*(contentWidth+40))
 	b.WriteString(top)
-	for _, line := range lines {
+	b.WriteString("\n")
+	b.WriteString(blank)
+	for i := range contentHeight {
 		b.WriteString("\n")
-		b.WriteString(border.Render("│"))
-		b.WriteString(line + strings.Repeat(" ", max(0, contentWidth-lipgloss.Width(line))))
-		b.WriteString(border.Render("│"))
+		b.WriteString(side)
+		if i >= len(lines) {
+			b.WriteString(strings.Repeat(" ", contentWidth))
+		} else {
+			line := lines[i]
+			w := styledWidth(line)
+			if w > contentWidth {
+				line = ansi.Truncate(line, contentWidth, "…")
+				w = styledWidth(line)
+			}
+			gap := max(0, contentWidth-w)
+			b.WriteString(strings.Repeat(" ", gap/2))
+			b.WriteString(line)
+			b.WriteString(strings.Repeat(" ", gap-gap/2))
+		}
+		b.WriteString(side)
 	}
+	b.WriteString("\n")
+	b.WriteString(blank)
 	b.WriteString("\n")
 	b.WriteString(bottom)
 	return b.String()
@@ -251,7 +272,7 @@ func dialogTextWidth() int {
 	return min(contentWidth-2-2*dialogPadX, 100)
 }
 
-// dialog draws a card in the middle of the content area, headed by title in tone.
+// dialog draws a card headed by title in tone, to be set over the page with overlay.
 func dialog(title string, tone styles.Tone, body ...string) string {
 	heading := styles.Render(styles.B("▲ ", tone), styles.B(title, tone))
 	width := dialogTextWidth()
@@ -274,10 +295,34 @@ func dialog(title string, tone styles.Tone, body ...string) string {
 		BorderForeground(styles.P.Color(tone)).
 		Padding(padY, dialogPadX).
 		Render(content)
-	return lipgloss.Place(contentWidth, contentHeight, lipgloss.Center, lipgloss.Center, card)
+	return card
 }
 
-// ErrorView shows the error in a card, in place of the page.
+// overlay sets card in the middle of the content area, over the page, which recedes behind it.
+func overlay(page, card string) string {
+	lines := strings.Split(ansi.Strip(page), "\n")
+	dim := sgr(styles.P.Rule, false, nil)
+	for i, l := range lines {
+		lines[i] = dim + l + ansi.ResetStyle
+	}
+	// A ring of blank cells keeps the page's text off the card's edge.
+	card = lipgloss.NewStyle().Padding(0, 1).Render(card)
+	w, h := lipgloss.Width(card), lipgloss.Height(card)
+	c := lipgloss.NewCanvas(contentWidth, contentHeight)
+	c.Compose(lipgloss.NewCompositor(
+		lipgloss.NewLayer(strings.Join(lines, "\n")),
+		lipgloss.NewLayer(card).X(max(0, (contentWidth-w)/2)).Y(max(0, (contentHeight-h)/2)).Z(1),
+	))
+	// The canvas leaves out the blank cells at the end of a line, and the frame centres a line
+	// shorter than the content area, which would move the card off the middle.
+	out := strings.Split(c.Render(), "\n")
+	for i, l := range out {
+		out[i] = l + strings.Repeat(" ", max(0, contentWidth-styledWidth(l)))
+	}
+	return strings.Join(out, "\n")
+}
+
+// ErrorView shows the error in a card.
 func (m model) ErrorView() string {
 	text := styles.CleanBlock(m.error)
 	width := min(80, dialogTextWidth(), lipgloss.Width(text))

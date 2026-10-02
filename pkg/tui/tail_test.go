@@ -235,3 +235,48 @@ func TestFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestTailCountsUnseenLines(t *testing.T) {
+	s := newTailState(1000)
+	s = s.add(entries(10), base)
+	s = s.add([]loki.Entry{entry(20, "api", "while following")}, base)
+	if s.unseen != 0 {
+		t.Fatalf("a following tail has seen every line, unseen %d", s.unseen)
+	}
+	s = s.move(-2)
+	s = s.add([]loki.Entry{entry(21, "api", "a"), entry(22, "api", "b")}, base)
+	if s.unseen != 2 {
+		t.Errorf("unseen = %d, want 2", s.unseen)
+	}
+	s.filter, _ = newLineFilter("nothing matches this")
+	s = s.add([]loki.Entry{entry(23, "api", "c")}, base)
+	if s.unseen != 2 {
+		t.Errorf("a line the filter hides is not unseen, got %d", s.unseen)
+	}
+	s.filter = lineFilter{}
+	s = s.rebuildView().move(len(s.view))
+	if s.unseen != 0 || !s.follow {
+		t.Errorf("back on the newest line, unseen %d, follow %v", s.unseen, s.follow)
+	}
+}
+
+func TestTailJumpsBetweenProblems(t *testing.T) {
+	m := tailModel(t) // lines: GET 200, POST 500, an error
+	m.tail = m.tail.add([]loki.Entry{entry(4, "api", "level=warn msg=slow"), entry(5, "api", "fine")}, base)
+	m = send(t, m, "g", "n")
+	if r, _ := m.tail.selected(); r.level != loki.LevelError || m.tail.follow {
+		t.Fatalf("n from the top should land on the error, got %q", r.entry.Line)
+	}
+	m = send(t, m, "n")
+	if r, _ := m.tail.selected(); r.level != loki.LevelWarn {
+		t.Errorf("n again should land on the warning, got %q", r.entry.Line)
+	}
+	m = send(t, m, "n")
+	if r, _ := m.tail.selected(); r.level != loki.LevelWarn || !strings.Contains(m.statusMsg, "no warnings or errors below") {
+		t.Errorf("past the last problem the cursor stays, got %q, status %q", r.entry.Line, m.statusMsg)
+	}
+	m = send(t, m, "N")
+	if r, _ := m.tail.selected(); r.level != loki.LevelError {
+		t.Errorf("N should go back to the error, got %q", r.entry.Line)
+	}
+}

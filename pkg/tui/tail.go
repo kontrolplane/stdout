@@ -75,6 +75,8 @@ type tailState struct {
 	total   uint64 // lines received, also the ones trimmed or filtered out
 	dropped uint64 // lines the server dropped because the tail fell behind
 
+	unseen int // lines that came in since the cursor stopped following
+
 	older    bool      // a load of older lines is in flight
 	olderEnd time.Time // where the next load of older lines ends
 }
@@ -175,7 +177,7 @@ const (
 )
 
 // lineWidth is the room left for the line itself, after the time, the level and the labels.
-func (t tailState) lineWidth() int {
+func (t *tailState) lineWidth() int {
 	w := contentWidth - tailGutter - timeWidth - 1 - levelWidth - 1 - 1
 	if lw := t.labelsShown(); lw > 0 {
 		w -= lw + 1
@@ -184,24 +186,24 @@ func (t tailState) lineWidth() int {
 }
 
 // labelsShown is the width of the labels column, 0 when it is hidden.
-func (t tailState) labelsShown() int {
+func (t *tailState) labelsShown() int {
 	if t.hideLabels || len(t.varying) == 0 {
 		return 0
 	}
 	return t.labelWidth
 }
 
-func (t tailState) visible(i int) row { return t.rows[t.view[i]] }
+func (t *tailState) visible(i int) row { return t.rows[t.view[i]] }
 
 // selected returns the row under the cursor.
-func (t tailState) selected() (row, bool) {
+func (t *tailState) selected() (row, bool) {
 	if t.cursor < 0 || t.cursor >= len(t.view) {
 		return row{}, false
 	}
 	return t.visible(t.cursor), true
 }
 
-func (t tailState) match(r row) bool {
+func (t *tailState) match(r *row) bool {
 	if t.pinnedOnly && !t.pins[r.id] {
 		return false
 	}
@@ -232,31 +234,61 @@ func (t tailState) add(entries []loki.Entry, now time.Time) tailState {
 }
 
 func (t tailState) insert(entries []loki.Entry) tailState {
+	if len(entries) == 0 {
+		return t
+	}
 	a := t.anchor()
-	rebuild := false
-	for _, e := range entries {
-		r := row{id: t.nextID, entry: e, level: loki.DetectLevel(e), stream: e.Labels.String()}
+	batch := make([]row, len(entries))
+	for i, e := range entries {
+		batch[i] = row{id: t.nextID, entry: e, level: loki.DetectLevel(e), stream: e.StreamKey()}
 		t.nextID++
-		t.track(r, 1)
-		n := len(t.rows)
-		if n > 0 && e.Time.Before(t.rows[n-1].entry.Time) {
-			i := sort.Search(n, func(i int) bool { return t.rows[i].entry.Time.After(e.Time) })
-			t.rows = slices.Insert(t.rows, i, r)
-			rebuild = true
-			continue
-		}
-		t.rows = append(t.rows, r)
-		if !rebuild && t.match(r) {
-			t.view = append(t.view, len(t.rows)-1)
+		t.track(batch[i], 1)
+	}
+	// Held lines come in several batches, each in order but not with each other.
+	if !slices.IsSortedFunc(batch, byTime) {
+		slices.SortStableFunc(batch, byTime)
+	}
+
+	// Late lines go after the rows of their time or before. The batch is merged in from the back,
+	// so the rows after the first late line move once rather than once for every line.
+	n := len(t.rows)
+	at := n
+	if n > 0 && batch[0].entry.Time.Before(t.rows[n-1].entry.Time) {
+		first := batch[0].entry.Time
+		at = sort.Search(n, func(i int) bool { return t.rows[i].entry.Time.After(first) })
+	}
+	t.rows = slices.Grow(t.rows, len(batch))[:n+len(batch)]
+	for i, j, k := n-1, len(batch)-1, len(t.rows)-1; j >= 0; k-- {
+		if i >= at && batch[j].entry.Time.Before(t.rows[i].entry.Time) {
+			t.rows[k] = t.rows[i]
+			i--
+		} else {
+			t.rows[k] = batch[j]
+			j--
 		}
 	}
-	if rebuild {
-		t = t.rebuildViewAt(a)
+
+	// The view up to the first new row stays as it is.
+	shown := len(t.view)
+	t.view = t.view[:sort.SearchInts(t.view, at)]
+	for i := at; i < len(t.rows); i++ {
+		if t.match(&t.rows[i]) {
+			t.view = append(t.view, i)
+		}
+	}
+	if !t.follow {
+		t.unseen += len(t.view) - shown
+	}
+	if a.ok && at < n {
+		t.cursor = t.find(a.cursor)
+		t.offset = t.find(a.top)
 	}
 	t = t.trim()
 	t = t.refreshLabels()
 	return t.scroll()
 }
+
+func byTime(a, b row) int { return a.entry.Time.Compare(b.entry.Time) }
 
 // prepend puts older lines before the ones in the buffer, leaving out the ones it already holds,
 // and reports how many it added.
@@ -280,7 +312,7 @@ func (t tailState) prepend(entries []loki.Entry) (tailState, int) {
 	a := t.anchor()
 	older := make([]row, len(entries))
 	for i, e := range entries {
-		older[i] = row{id: t.nextID, entry: e, level: loki.DetectLevel(e), stream: e.Labels.String()}
+		older[i] = row{id: t.nextID, entry: e, level: loki.DetectLevel(e), stream: e.StreamKey()}
 		t.nextID++
 		t.track(older[i], 1)
 	}
@@ -319,8 +351,8 @@ func (t tailState) rebuildView() tailState {
 
 func (t tailState) rebuildViewAt(a anchor) tailState {
 	view := make([]int, 0, len(t.rows))
-	for i, r := range t.rows {
-		if t.match(r) {
+	for i := range t.rows {
+		if t.match(&t.rows[i]) {
 			view = append(view, i)
 		}
 	}
@@ -333,7 +365,7 @@ func (t tailState) rebuildViewAt(a anchor) tailState {
 }
 
 // find returns where r is in view, or the first row shown after it in time.
-func (t tailState) find(r row) int {
+func (t *tailState) find(r row) int {
 	i := sort.Search(len(t.view), func(i int) bool { return !t.visible(i).entry.Time.Before(r.entry.Time) })
 	for j := i; j < len(t.view) && t.visible(j).entry.Time.Equal(r.entry.Time); j++ {
 		if t.visible(j).id == r.id {
@@ -353,7 +385,9 @@ func (t tailState) trim() tailState {
 		t.track(r, -1)
 		delete(t.pins, r.id)
 	}
-	t.rows = slices.Clone(t.rows[drop:])
+	kept := copy(t.rows, t.rows[drop:])
+	clear(t.rows[kept:])
+	t.rows = t.rows[:kept]
 	view := make([]int, 0, len(t.view))
 	removed := 0
 	for _, i := range t.view {
@@ -413,19 +447,37 @@ func (t tailState) refreshLabels() tailState {
 }
 
 // height is how many screen lines the row at i of view takes.
-func (t tailState) height(i int) int {
+func (t *tailState) height(i int) int {
 	if !t.wrap {
 		return 1
 	}
 	return len(wrapLine(styles.Clean(t.visible(i).entry.Line), t.lineWidth()))
 }
 
-// wrapLine breaks a line into pieces of width columns.
+// wrapLine breaks a line into pieces of at most width columns, after a space or a comma where one
+// is in the second half of a piece, so words and values stay whole, and anywhere otherwise. The
+// pieces hold every byte of the line, in order.
 func wrapLine(s string, width int) []string {
-	if ansi.StringWidth(s) <= width {
+	if textWidth(s) <= width {
 		return []string{s}
 	}
-	return strings.Split(ansi.Hardwrap(s, width, true), "\n")
+	var out []string
+	for textWidth(s) > width {
+		head := truncateText(s, width)
+		at := len(head)
+		if i := strings.LastIndexAny(head, " ,"); i >= len(head)/2 {
+			at = i + 1
+		}
+		if at == 0 {
+			at = len(s) // a rune wider than the line
+		}
+		out = append(out, s[:at])
+		s = s[at:]
+	}
+	if s != "" {
+		out = append(out, s)
+	}
+	return out
 }
 
 // scroll keeps the cursor on screen, on the newest line when following, and the screen filled.
@@ -437,6 +489,7 @@ func (t tailState) scroll() tailState {
 	}
 	if t.follow {
 		t.cursor = n - 1
+		t.unseen = 0
 	}
 	t.cursor = max(0, min(t.cursor, n-1))
 	t.offset = max(0, min(t.offset, n-1))
@@ -471,6 +524,17 @@ func (t tailState) move(delta int) tailState {
 	return t.scroll()
 }
 
+// problem finds the nearest line at warning level or above from the cursor in the direction of
+// step, for jumping between the lines that need a look.
+func (t *tailState) problem(step int) (int, bool) {
+	for i := t.cursor + step; i >= 0 && i < len(t.view); i += step {
+		if t.visible(i).level >= loki.LevelWarn {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // setFilter applies a filter, keeping the cursor on its line.
 func (t tailState) setFilter(f lineFilter) tailState {
 	t.filter = f
@@ -501,6 +565,7 @@ func (t tailState) clear() tailState {
 	t.pins = map[uint64]bool{}
 	t.streams = map[string]*streamInfo{}
 	t.varying = nil
+	t.unseen = 0
 	t.olderEnd = time.Time{}
 	return t
 }
@@ -546,7 +611,7 @@ func (t tailState) renderEmpty(h int) string {
 }
 
 // renderRow draws the row at i of view: one screen line, or with wrapping on, as many as it needs.
-func (t tailState) renderRow(i int, focused bool) []string {
+func (t *tailState) renderRow(i int, focused bool) []string {
 	r := t.visible(i)
 	selected := i == t.cursor
 	var bg color.Color
@@ -599,39 +664,43 @@ func (t tailState) renderRow(i int, focused bool) []string {
 		return []string{prefix.String() + renderCell(t.highlight(line), column{width: width}, bg) + pad(1, bg)}
 	}
 	pieces := wrapLine(line, width)
+	// The line is tinted whole and then cut where it wraps, so a match or a quoted value keeps its
+	// ink across the break.
+	offsets := make([]int, 0, len(pieces)-1)
+	at := 0
+	for _, piece := range pieces[:len(pieces)-1] {
+		at += len(piece)
+		offsets = append(offsets, at)
+	}
+	cells := cut(t.highlight(line), offsets)
+	if at+len(pieces[len(pieces)-1]) != len(line) {
+		// The wrap changed the text, so the offsets do not fall on it.
+		cells = cells[:0]
+		for _, piece := range pieces {
+			cells = append(cells, t.highlight(piece))
+		}
+	}
 	indent := pad(contentWidth-width-1, bg)
-	out := make([]string, len(pieces))
-	for j, piece := range pieces {
+	out := make([]string, len(cells))
+	for j, c := range cells {
 		lead := indent
 		if j == 0 {
 			lead = prefix.String()
 		}
-		out[j] = lead + renderCell(t.highlight(piece), column{width: width}, bg) + pad(1, bg)
+		out[j] = lead + renderCell(c, column{width: width}, bg) + pad(1, bg)
 	}
 	return out
 }
 
-// highlight splits a line into spans, with the text the filter matches set apart.
-func (t tailState) highlight(line string) cell {
+// highlight tints a line and sets the text the filter matches apart.
+func (t *tailState) highlight(line string) cell {
+	c := tint(line)
 	if !t.filter.active() || t.filter.exclude {
-		return cell{{Text: line, Tone: styles.ToneBody}}
+		return c
 	}
-	var c cell
-	last := 0
-	for _, m := range t.filter.re.FindAllStringIndex(line, -1) {
-		if m[0] == m[1] {
-			continue
-		}
-		if m[0] > last {
-			c = append(c, styles.Span{Text: line[last:m[0]], Tone: styles.ToneBody})
-		}
-		c = append(c, styles.Span{Text: line[m[0]:m[1]], Tone: styles.ToneWarm, Bold: true})
-		last = m[1]
-	}
-	if last < len(line) {
-		c = append(c, styles.Span{Text: line[last:], Tone: styles.ToneBody})
-	}
-	return c
+	matches := t.filter.re.FindAllStringIndex(line, -1)
+	matches = slices.DeleteFunc(matches, func(m []int) bool { return m[0] == m[1] })
+	return mark(c, matches)
 }
 
 // position describes where the cursor is, e.g. "12 of 240".
@@ -685,12 +754,13 @@ func (m model) onTail(msg messages.TailMsg) (model, tea.Cmd) {
 	t = t.add(msg.Entries, time.Now())
 	var cmd tea.Cmd
 	switch {
-	case msg.Closed:
-		t.running = false
 	case msg.State == loki.Failed:
+		// The follow closes right after it fails, both can come in one message.
 		t.running = false
 		t.state, t.err = msg.State, msg.Err
 		m.error = "the tail stopped: " + loki.Describe(msg.Err)
+	case msg.Closed:
+		t.running = false
 	case msg.State == loki.Retrying && t.state != loki.Retrying:
 		t.state, t.err, t.retryAt = msg.State, msg.Err, msg.RetryAt
 		if msg.Err != nil && !time.Now().After(msg.RetryAt) {
@@ -849,6 +919,23 @@ func (m model) TailUpdate(msg tea.Msg) (model, tea.Cmd) {
 		if r, ok := t.selected(); ok {
 			return m.startTail(loki.StreamSelector(r.entry.Labels))
 		}
+		return m, nil
+	}
+
+	if key.Matches(keyMsg, m.keys.NextProblem, m.keys.PrevProblem) {
+		step := 1
+		if key.Matches(keyMsg, m.keys.PrevProblem) {
+			step = -1
+		}
+		next, ok := t.problem(step)
+		if !ok {
+			where := "below"
+			if step < 0 {
+				where = "above"
+			}
+			return m.setStatus("no warnings or errors "+where, styles.ToneWarning)
+		}
+		m.tail = t.move(next - t.cursor)
 		return m, nil
 	}
 

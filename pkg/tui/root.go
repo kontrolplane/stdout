@@ -229,6 +229,10 @@ func (m model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
 	v.WindowTitle = m.programName
+	if m.page != labelPicker && m.tail.query != "" {
+		// Several tails in tabs of one terminal are told apart by their queries.
+		v.WindowTitle += " · " + truncate(styles.Clean(m.tail.query), 60)
+	}
 	v.ForegroundColor = styles.P.Text
 	if styles.Paint {
 		v.BackgroundColor = styles.P.Base
@@ -261,21 +265,27 @@ func (m model) render() string {
 		frame(styles.Render(m.breadcrumb()...), meta, foot, m.content()) + "\n" +
 		m.renderFooter()
 
-	placed := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, mainView)
-	if m.width > 0 {
-		placed = clip(placed, m.width, m.height)
+	if m.width == 0 {
+		return mainView
 	}
-	return placed
+	return place(m.width, m.height, mainView)
 }
 
-// content renders what the frame holds: the page, or the error, loading or help in its place.
+// content renders what the frame holds: the page, with the help or an error over it, or the
+// loading notice in its place.
 func (m model) content() string {
+	page := m.pageView()
 	switch {
 	case m.showHelp:
-		return m.renderHelpOverlay()
+		return overlay(page, m.renderHelp())
 	case m.error != "":
-		return m.ErrorView()
-	case m.loading:
+		return overlay(page, m.ErrorView())
+	}
+	return page
+}
+
+func (m model) pageView() string {
+	if m.loading {
 		return m.LoadingView()
 	}
 	switch m.page {
@@ -328,9 +338,13 @@ func (m model) frameMeta() (string, string) {
 			meta = styles.Render(spans...)
 		}
 		if m.page == tailView {
-			if t.follow {
-				foot = append(foot, styles.Render(styles.S("● ", styles.ToneAccent), styles.S("following", styles.ToneMuted)))
-			} else {
+			switch {
+			case t.follow:
+				foot = append(foot, styles.Render(styles.S("↓ ", styles.ToneAccent), styles.S("following", styles.ToneMuted)))
+			case t.unseen > 0:
+				foot = append(foot, styles.Render(styles.B("↓ "+compactCount(uint64(t.unseen))+" new", styles.ToneAccent),
+					styles.S(" G jumps there", styles.ToneFaint)))
+			default:
 				foot = append(foot, styles.Faint("follow off"))
 			}
 			if t.wrap {
@@ -372,13 +386,23 @@ func (m model) renderFooter() string {
 func (m model) renderFooterLeft(width int) string {
 	switch {
 	case m.editing:
-		return styles.Accent("› ") + m.editor.View() + "  " + hints([2]string{"enter", "tail"}, [2]string{"esc", "cancel"})
+		return styles.Accent("› ") + m.editor.View() + "  " + editorHints()
 	case m.page == labelPicker && m.picker.filtering:
 		return renderFilterBar(m.picker.filterInput.View())
 	case m.page == tailView && m.tail.filtering:
 		return renderFilterBar(m.tail.filterInput.View())
 	}
 	return fitHints(width, m.shortHelp()...)
+}
+
+func editorHints() string {
+	return hints([2]string{"enter", "tail"}, [2]string{"esc", "cancel"})
+}
+
+// editorWidth leaves the query editor the footer but for its edges, its prompt, its hints and the
+// cell the cursor takes past the end of the text.
+func editorWidth() int {
+	return frameWidth - 4 - 2 - 2 - styledWidth(editorHints()) - 1
 }
 
 func renderFilterBar(inputView string) string {
@@ -389,12 +413,21 @@ func renderFilterBar(inputView string) string {
 // fitHints renders the hints that fit width. Hints are dropped from the end but for the last two,
 // help and back or quit, which stay.
 func fitHints(width int, pairs ...[2]string) string {
-	pairs = slices.Clone(pairs)
-	for len(pairs) > 2 && lipgloss.Width(hints(pairs...)) > width {
-		pairs = slices.Delete(pairs, len(pairs)-3, len(pairs)-2)
+	var key strings.Builder
+	fmt.Fprint(&key, width)
+	for _, p := range pairs {
+		key.WriteString("\x00" + p[0] + "\x00" + p[1])
 	}
-	return hints(pairs...)
+	return hintsMemo.get(key.String(), func() string {
+		pairs = slices.Clone(pairs)
+		for len(pairs) > 2 && styledWidth(hints(pairs...)) > width {
+			pairs = slices.Delete(pairs, len(pairs)-3, len(pairs)-2)
+		}
+		return hints(pairs...)
+	})
 }
+
+var hintsMemo memo
 
 func hints(pairs ...[2]string) string {
 	parts := make([]string, len(pairs))
@@ -417,83 +450,141 @@ func (m model) shortHelp() [][2]string {
 	case tailView:
 		return [][2]string{{"enter", "open"}, {"space", "pin"}, {"tab", "pinned"}, {"f", "follow"}, {"p", "pause"}, {"w", "wrap"}, {"e", "edit query"}, {"c", "copy"}, {"/", "filter"}, {"?", "help"}, {"q", "back"}}
 	case lineDetails:
-		return [][2]string{{"↑/↓", "scroll"}, {"[/]", "previous/next"}, {"space", "pin"}, {"s", "tail stream"}, {"c", "copy"}, {"?", "help"}, {"q", "back"}}
+		h := [][2]string{{"↑/↓", "scroll"}, {"[/]", "previous/next"}, {"space", "pin"}, {"s", "tail stream"}, {"c", "copy"}, {"?", "help"}, {"q", "back"}}
+		if m.details.fieldsOverflow() {
+			panel := "fields"
+			if m.details.onFields {
+				panel = "message"
+			}
+			h = slices.Insert(h, 1, [2]string{"tab", panel})
+		}
+		return h
 	}
 	return nil
 }
 
-// renderHelpOverlay draws the key reference in a card, as roomy as the content area allows.
-func (m model) renderHelpOverlay() string {
-	var overlay string
-	for _, fit := range []struct{ padY, padX, gap int }{{1, 4, 6}, {1, 2, 3}, {0, 2, 3}} {
-		overlay = lipgloss.NewStyle().
+// renderHelp draws the key reference in a card, as roomy as the content area allows.
+func (m model) renderHelp() string {
+	var card string
+	for _, fit := range []struct{ padY, padX, gap int }{{1, 4, 5}, {1, 2, 3}, {0, 2, 3}} {
+		card = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(styles.P.RuleBold).
 			Padding(fit.padY, fit.padX).
-			Render(renderHelpContent(contentWidth-2-2*fit.padX, fit.gap))
-		if lipgloss.Width(overlay) <= contentWidth && lipgloss.Height(overlay) <= contentHeight {
+			Render(renderHelpContent(m.page, contentWidth-4-2*fit.padX, contentHeight-2-2*fit.padY, fit.gap))
+		if lipgloss.Width(card) <= contentWidth-2 && lipgloss.Height(card) <= contentHeight {
 			break
 		}
 	}
-	return lipgloss.Place(contentWidth, contentHeight, lipgloss.Center, lipgloss.Center, overlay)
+	return card
 }
 
-// renderHelpContent lays the help out in three columns, or the filters under the other two when
-// three do not fit width.
-func renderHelpContent(width, gap int) string {
-	title := func(s string) string {
-		return styles.Fg(styles.ToneAccent).Bold(true).MarginBottom(1).Render(s)
+// helpSection is a column of the key reference.
+type helpSection struct {
+	page  page
+	title string
+	rows  [][2]string
+}
+
+var helpSections = []helpSection{
+	{labelPicker, "labels", [][2]string{
+		{"↑/k ↓/j", "move"},
+		{"tab ←/→", "switch list"},
+		{"space", "select value"},
+		{"!", "exclude values"},
+		{"x / X", "clear / clear all"},
+		{"enter", "tail selection"},
+		{"e", "write a query"},
+		{"/", "filter the list"},
+		{"r", "refresh"},
+		{"q", "quit"},
+	}},
+	{tailView, "tail", [][2]string{
+		{"↑ at top", "older lines"},
+		{"g / G", "oldest / newest"},
+		{"n / N", "next / prev problem"},
+		{"enter", "open line"},
+		{"space", "pin line"},
+		{"tab", "pinned only"},
+		{"f / p", "follow / pause"},
+		{"w / l", "wrap / labels"},
+		{"/", "filter lines"},
+		{"e", "edit query"},
+		{"s", "tail its stream"},
+		{"c", "copy line"},
+		{"ctrl+l", "clear lines"},
+		{"esc / q", "back"},
+	}},
+	{lineDetails, "line", [][2]string{
+		{"↑/↓ g/G", "scroll"},
+		{"tab", "fields / message"},
+		{"[ / ]", "previous / next"},
+		{"space", "pin"},
+		{"s", "tail its stream"},
+		{"c", "copy line"},
+		{"esc / q", "back"},
+	}},
+}
+
+// renderHelpContent lays the sections out with the one of the current page first: side by side
+// when they fit width, else in rows of two, else the current page alone.
+func renderHelpContent(current page, width, height, gap int) string {
+	title := func(s string, on bool) string {
+		tone := styles.ToneMuted
+		if on {
+			tone = styles.ToneAccent
+		}
+		return styles.Fg(tone).Bold(true).MarginBottom(1).Render(s)
 	}
-	keyStyle := styles.Fg(styles.ToneText).Bold(true).Width(11)
-	row := func(key, desc string) string {
-		return keyStyle.Render(key) + styles.Muted(desc)
+	keyStyle := styles.Fg(styles.ToneText).Bold(true).Width(10)
+	column := func(s helpSection) string {
+		lines := []string{title(s.title, s.page == current)}
+		for _, r := range s.rows {
+			lines = append(lines, keyStyle.Render(r[0])+styles.Muted(r[1]))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
 	}
 
-	labels := lipgloss.JoinVertical(lipgloss.Left,
-		title("labels"),
-		row("↑/k ↓/j", "move"),
-		row("tab ←/→", "switch list"),
-		row("space", "select value"),
-		row("!", "exclude values"),
-		row("x / X", "clear / clear all"),
-		row("enter", "tail selection"),
-		row("e", "write a query"),
-		row("r", "refresh"),
-		row("q", "quit"),
-	)
-
-	tail := lipgloss.JoinVertical(lipgloss.Left,
-		title("tail"),
-		row("↑ at top", "older lines"),
-		row("g / G", "oldest / newest"),
-		row("enter", "open line"),
-		row("space", "pin line"),
-		row("tab", "pinned only"),
-		row("f / p", "follow / pause"),
-		row("w / l", "wrap / labels"),
-		row("s", "tail its stream"),
-		row("c", "copy line"),
-		row("ctrl+l", "clear lines"),
-		row("q / esc", "back"),
-	)
-
-	filters := lipgloss.JoinVertical(lipgloss.Left,
-		title("filters"),
-		row("timeout", "contains, any case"),
-		row("/5\\d\\d/", "regular expression"),
-		row("!healthz", "hide matching"),
+	columns := []string{}
+	for _, s := range helpSections {
+		if s.page == current {
+			columns = append([]string{column(s)}, columns...)
+		} else {
+			columns = append(columns, column(s))
+		}
+	}
+	columns = append(columns, lipgloss.JoinVertical(lipgloss.Left,
+		title("filters", false),
+		keyStyle.Render("timeout")+styles.Muted("contains, any case"),
+		keyStyle.Render(`/5\d\d/`)+styles.Muted("regular expression"),
+		keyStyle.Render("!healthz")+styles.Muted("hide matching"),
 		"",
-		styles.Muted("/ filters the lines"),
-		styles.Muted("on screen, e changes"),
-		styles.Muted("what loki sends, like"),
+		styles.Muted("/ filters the lines on"),
+		styles.Muted("screen, e changes what"),
+		styles.Muted("loki sends, like"),
 		styles.Fg(styles.ToneText).Render(`{app="api"} |= "err"`),
-	)
+	))
 
 	spaced := lipgloss.NewStyle().MarginRight(gap)
-	columns := lipgloss.JoinHorizontal(lipgloss.Top, spaced.Render(labels), spaced.Render(tail), filters)
-	if lipgloss.Width(columns) > width {
-		columns = lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.JoinHorizontal(lipgloss.Top, spaced.Render(labels), tail), "", filters)
+	row := func(cols ...string) string {
+		for i := range cols[:len(cols)-1] {
+			cols[i] = spaced.Render(cols[i])
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, cols...)
 	}
-	return lipgloss.JoinVertical(lipgloss.Center, columns, "", styles.Faint("press any key to close"))
+	fits := func(s string) bool { return lipgloss.Width(s) <= width && lipgloss.Height(s) <= height-2 }
+
+	layouts := []string{
+		row(slices.Clone(columns)...),
+		lipgloss.JoinVertical(lipgloss.Left, row(columns[0], columns[1]), "", row(columns[2], columns[3])),
+		row(columns[0], columns[3]),
+	}
+	body := columns[0]
+	for _, l := range layouts {
+		if fits(l) {
+			body = l
+			break
+		}
+	}
+	return lipgloss.JoinVertical(lipgloss.Center, body, "", styles.Faint("press any key to close"))
 }

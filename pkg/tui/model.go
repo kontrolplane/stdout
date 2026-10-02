@@ -78,10 +78,10 @@ type model struct {
 func (m model) resize() model {
 	m.picker.labelsTable.setSize(leftContentWidth, pickerTableHeight())
 	m.picker.valuesTable.setSize(rightContentWidth, pickerTableHeight())
-	m.editor.SetWidth(contentWidth - 30)
+	m.editor.SetWidth(editorWidth())
 	m.tail = m.tail.scroll()
 	if m.page == lineDetails {
-		m.details.resize()
+		m.resizeDetails()
 	}
 	return m
 }

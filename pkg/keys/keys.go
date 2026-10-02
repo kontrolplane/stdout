@@ -27,6 +27,8 @@ type KeyMap struct {
 	Stream          key.Binding
 	Previous        key.Binding
 	Next            key.Binding
+	NextProblem     key.Binding
+	PrevProblem     key.Binding
 	ClearBuffer     key.Binding
 	SwitchFocus     key.Binding
 	Back            key.Binding
@@ -122,6 +124,14 @@ var Keys = KeyMap{
 	Next: key.NewBinding(
 		key.WithKeys("]"),
 		key.WithHelp("]", "next line"),
+	),
+	NextProblem: key.NewBinding(
+		key.WithKeys("n"),
+		key.WithHelp("n", "next warning or error"),
+	),
+	PrevProblem: key.NewBinding(
+		key.WithKeys("N"),
+		key.WithHelp("N", "previous warning or error"),
 	),
 	ClearBuffer: key.NewBinding(
 		key.WithKeys("ctrl+l"),
